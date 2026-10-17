@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Inject version from tag
+        shell: pwsh
+        run: |
+          $version = '${{ github.ref_name }}'.TrimStart('v')
+          if ($version -notmatch '^\d+\.\d+\.\d+(-[\w.]+)?$') {
+            Write-Error "tag 版本号格式无效: $version"
+            exit 1
+          }
+          (Get-Content Cargo.toml -Raw) -replace '(?m)^version = ".*"', "version = `"$version`"" | Set-Content Cargo.toml -NoNewline
+          (Get-Content quark-reflex.iss -Raw) -replace '#define MyAppVersion ".*"', "#define MyAppVersion `"$version`"" | Set-Content quark-reflex.iss -NoNewline
+          Write-Host "已注入版本号: $version"
+
+      - name: Build executable
+        run: cargo build --release
+
+      - name: Install Inno Setup
+        run: winget install JRSoftware.InnoSetup --accept-package-agreements --accept-source-agreements --silent
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = @('C:\Program Files (x86)\Inno Setup 6\ISCC.exe', "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe") |
+            Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { Write-Error '未找到 ISCC.exe'; exit 1 }
+          & $iscc quark-reflex.iss
+
+      - name: Create release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $installer = (Get-Item 'dist/QuarkReflex-Setup-*.exe').FullName
+          gh release create '${{ github.ref_name }}' $installer --title '${{ github.ref_name }}' --generate-notes

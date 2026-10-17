@@ -25,7 +25,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 ChangesEnvironment=no
 
 [Languages]
-Name: "chinesesimplified"; MessagesFile: "compiler:LanguagesUnofficial\ChineseSimplified.isl"
+Name: "chinesesimplified"; MessagesFile: "installer\ChineseSimplified.isl"
 
 [CustomMessages]
 chinesesimplified.CreateDesktopIcon=创建桌面快捷方式(&D)
