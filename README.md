@@ -5,6 +5,7 @@
 <h1 align="center">Quark Reflex · 夸克助手桌面小窗</h1>
 <p align="center"><strong>让夸克助手随叫随到。</strong><br>一个轻巧、可置顶、可用全局快捷键唤出的 Windows AI 聊天小窗。</p>
 <p align="center">
+  <a href="https://github.com/wanglh39/quark-reflex/releases"><img src="https://img.shields.io/github/v/release/wanglh39/quark-reflex" alt="Release" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" /></a>
   <img src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-4563F5" alt="Windows x64" />
   <img src="https://img.shields.io/badge/Rust-tao%20%2B%20wry-dea584" alt="Rust" />
