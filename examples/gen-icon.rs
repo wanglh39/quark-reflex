@@ -23,4 +23,12 @@ fn main() {
     let mut enc = image::codecs::ico::IcoEncoder::new(std::io::BufWriter::new(f));
     enc.encode_images(&frames).expect("编码 ICO 失败");
     println!("assets/icon.ico 已生成（尺寸 {sizes:?}）");
+
+    let (rgba, w, h) = render_icon_rgba(256);
+    std::fs::create_dir_all("docs/assets").expect("创建 docs/assets 失败");
+    let lf = std::fs::File::create("docs/assets/logo.png").expect("创建 logo.png 失败");
+    PngEncoder::new(std::io::BufWriter::new(lf))
+        .write_image(&rgba, w, h, ExtendedColorType::Rgba8)
+        .expect("logo PNG 编码失败");
+    println!("docs/assets/logo.png 已生成（256px）");
 }
