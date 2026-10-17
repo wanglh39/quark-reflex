@@ -1,0 +1,21 @@
+[package]
+name = "quark-reflex"
+version = "0.1.0"
+edition = "2024"
+description = "夸克助手桌面小窗：置顶、热键呼出的轻量 AI 助手窗口"
+license = "MIT"
+
+[dependencies]
+global-hotkey = "0.8.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tao = "0.37.1"
+tray-icon = "0.26.1"
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_System_Threading", "Win32_Security", "Win32_UI_WindowsAndMessaging"] }
+wry = { version = "0.55", features = ["devtools"] }
+
+[build-dependencies]
+winresource = "0.1"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
