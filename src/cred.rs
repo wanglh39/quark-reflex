@@ -12,7 +12,33 @@ use crate::config;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub const PROTOCOL_NAME: &str = "qrcred";
-pub const CDP_PORT: u16 = 9333;
+const CDP_PORT_BASE: u16 = 9333;
+
+static CDP_PORT_CELL: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+
+fn is_cdp_alive(port: u16) -> bool {
+    http_req(port, "GET", "/json/version")
+        .map(|b| b.contains("webSocketDebuggerUrl"))
+        .unwrap_or(false)
+}
+
+fn port_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+fn cdp_port() -> u16 {
+    *CDP_PORT_CELL.get_or_init(|| {
+        if is_cdp_alive(CDP_PORT_BASE) {
+            return CDP_PORT_BASE;
+        }
+        for p in CDP_PORT_BASE..CDP_PORT_BASE + 20 {
+            if port_free(p) {
+                return p;
+            }
+        }
+        CDP_PORT_BASE
+    })
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default)]
@@ -343,9 +369,7 @@ fn urlencode(s: &str) -> String {
 }
 
 pub fn cdp_ready() -> bool {
-    http_req(CDP_PORT, "GET", "/json/version")
-        .map(|b| b.contains("webSocketDebuggerUrl"))
-        .unwrap_or(false)
+    is_cdp_alive(cdp_port())
 }
 
 fn cdp_call(
@@ -398,7 +422,7 @@ fn bridge_ready_js() -> &'static str {
 }
 
 fn qianwen_page_ws_urls() -> Result<Vec<String>, String> {
-    let body = http_req(CDP_PORT, "GET", "/json")?;
+    let body = http_req(cdp_port(), "GET", "/json")?;
     let tabs: Vec<Value> = serde_json::from_str(&body).map_err(|e| e.to_string())?;
     Ok(tabs
         .iter()
@@ -451,7 +475,7 @@ fn ensure_bridge_ws(refresh: bool) -> Result<String, String> {
             }
         }
     }
-    let body = http_req(CDP_PORT, "PUT", "/json/new")?;
+    let body = http_req(cdp_port(), "PUT", "/json/new")?;
     let tab: Value =
         serde_json::from_str(&body).map_err(|e| format!("新标签页响应解析失败：{e}"))?;
     let ws_url = tab
@@ -710,15 +734,17 @@ pub fn start_grab(proxy: tao::event_loop::EventLoopProxy<crate::AppEvent>) {
 
 fn open_chat_tab() -> Result<(String, WsConn), String> {
     if !cdp_ready() {
+        confirm_kill_quark()?;
         let _ = std::process::Command::new("taskkill")
             .args(["/F", "/T", "/IM", "quark.exe"])
             .creation_flags(CREATE_NO_WINDOW)
             .output();
         thread::sleep(Duration::from_millis(2000));
         let exe = quark_exe()
-            .ok_or("未找到夸克浏览器（期望位于 %LOCALAPPDATA%\\Programs\\Quark\\quark.exe）。请先安装并登录夸克 PC 浏览器。")?;
+            .ok_or(QUARK_NOT_FOUND_MSG)?;
+        let port = cdp_port();
         std::process::Command::new(&exe)
-            .arg(format!("--remote-debugging-port={CDP_PORT}"))
+            .arg(format!("--remote-debugging-port={port}"))
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .map_err(|e| format!("启动夸克浏览器失败：{e}"))?;
@@ -731,11 +757,13 @@ fn open_chat_tab() -> Result<(String, WsConn), String> {
             }
         }
         if !up {
-            return Err("夸克浏览器调试端口未就绪（15 秒超时），请重试。".into());
+            return Err(format!(
+                "夸克浏览器调试端口 {port} 未就绪（15 秒超时），请重试。"
+            ));
         }
     }
     let new_tab = http_req(
-        CDP_PORT,
+        cdp_port(),
         "PUT",
         &format!("/json/new?url={}", urlencode("about:blank")),
     )?;
@@ -795,7 +823,7 @@ fn trace_flow() -> Result<(bool, String), String> {
         .unwrap_or("[]");
     let _ = std::fs::write(config::app_dir().join("trace-log.json"), val);
     dbg_log(&format!("trace: {} bytes written", val.len()));
-    let _ = http_req(CDP_PORT, "GET", &format!("/json/close/{target_id}"));
+    let _ = http_req(cdp_port(), "GET", &format!("/json/close/{target_id}"));
     Ok((false, "TRACE_DONE".into()))
 }
 
@@ -865,7 +893,7 @@ fn network_trace() -> Result<(bool, String), String> {
         config::app_dir().join("network-log.json"),
         serde_json::to_string_pretty(&out).unwrap_or_default(),
     );
-    let _ = http_req(CDP_PORT, "GET", &format!("/json/close/{target_id}"));
+    let _ = http_req(cdp_port(), "GET", &format!("/json/close/{target_id}"));
     dbg_log("network_trace done");
     Ok((false, "NETTRACE_DONE".into()))
 }
@@ -953,30 +981,206 @@ const TRACE_HOOK_JS: &str = r#"
 })();
 "#;
 
+const QUARK_NOT_FOUND_MSG: &str = "未找到夸克浏览器。请先安装夸克 PC 浏览器；\
+若已安装在自定义目录，请在小窗设置中填写 quark.exe 的完整路径。";
+
+fn quark_running() -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq quark.exe", "/NH"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .to_lowercase()
+                .contains("quark.exe")
+        })
+        .unwrap_or(false)
+}
+
+fn confirm_kill_quark() -> Result<(), String> {
+    if !quark_running() {
+        return Ok(());
+    }
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, IDYES, MB_ICONWARNING, MB_YESNO,
+    };
+    let r = unsafe {
+        MessageBoxW(
+            None,
+            windows::core::w!(
+                "获取登录凭证需要以调试模式重启夸克浏览器。\n\
+                 正在浏览的页面将会关闭，未保存的内容可能丢失。\n\n是否继续？"
+            ),
+            windows::core::w!("夸克助手"),
+            MB_YESNO | MB_ICONWARNING,
+        )
+    };
+    if r == IDYES {
+        Ok(())
+    } else {
+        Err("已取消：本次未获取登录凭证。".into())
+    }
+}
+
 fn quark_exe() -> Option<PathBuf> {
-    let local = std::env::var("LOCALAPPDATA").ok()?;
-    let candidates = [
-        PathBuf::from(&local).join("Programs").join("Quark").join("quark.exe"),
-        PathBuf::from(r"C:\Program Files\Quark\quark.exe"),
-        PathBuf::from(r"C:\Program Files (x86)\Quark\quark.exe"),
-    ];
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let custom = config::load().quark_exe.trim().to_string();
+    if !custom.is_empty() {
+        candidates.push(PathBuf::from(&custom));
+    }
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        candidates.push(PathBuf::from(local).join("Programs").join("Quark").join("quark.exe"));
+    }
+    candidates.push(PathBuf::from(r"C:\Program Files\Quark\quark.exe"));
+    candidates.push(PathBuf::from(r"C:\Program Files (x86)\Quark\quark.exe"));
+    candidates.extend(quark_exe_from_registry());
     candidates.into_iter().find(|p| p.is_file())
+}
+
+fn quark_exe_from_registry() -> Vec<PathBuf> {
+    use windows_registry::{CURRENT_USER, LOCAL_MACHINE};
+    let mut out: Vec<PathBuf> = Vec::new();
+    let roots = [CURRENT_USER, LOCAL_MACHINE];
+
+    for root in roots {
+        for sub in [
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\quark.exe",
+            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\quark.exe",
+        ] {
+            if let Ok(key) = root.open(sub) {
+                if let Ok(path) = key.get_string("") {
+                    let p = PathBuf::from(path.trim());
+                    if p.is_file() {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+    }
+
+    for root in roots {
+        for sub in [
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        ] {
+            let Ok(key) = root.open(sub) else { continue };
+            let Ok(names) = key.keys() else { continue };
+            for name in names {
+                let Ok(sk) = key.open(&name) else { continue };
+                let display = sk.get_string("DisplayName").unwrap_or_default();
+                let lower = display.to_lowercase();
+                if (!lower.contains("quark") && !display.contains("夸克")) || lower.contains("reflex")
+                {
+                    continue;
+                }
+                if let Ok(loc) = sk.get_string("InstallLocation") {
+                    let loc = loc.trim();
+                    if !loc.is_empty() {
+                        out.push(PathBuf::from(loc).join("quark.exe"));
+                    }
+                }
+                for field in ["DisplayIcon", "UninstallString"] {
+                    if let Ok(raw) = sk.get_string(field) {
+                        push_quark_candidates(&mut out, &raw);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn push_quark_candidates(out: &mut Vec<PathBuf>, raw: &str) {
+    let s = raw.trim();
+    if s.is_empty() {
+        return;
+    }
+    let s = s.split(',').next().unwrap_or("").trim();
+    let paths: Vec<String> = if let Some(rest) = s.strip_prefix('"') {
+        match rest.find('"') {
+            Some(end) => vec![rest[..end].to_string()],
+            None => vec![rest.to_string()],
+        }
+    } else {
+        let words: Vec<&str> = s.split(' ').collect();
+        (1..=words.len())
+            .map(|i| words[..i].join(" "))
+            .collect()
+    };
+    for p in paths {
+        let pb = PathBuf::from(p.trim());
+        if pb.extension().map(|e| e.eq_ignore_ascii_case("exe")).unwrap_or(false) {
+            let is_quark = pb
+                .file_name()
+                .map(|f| f.to_string_lossy().eq_ignore_ascii_case("quark.exe"))
+                .unwrap_or(false);
+            if is_quark {
+                out.push(pb);
+            } else if let Some(dir) = pb.parent() {
+                out.push(dir.join("quark.exe"));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn quark_registry_probe_finds_local_install() {
+        let found = super::quark_exe_from_registry();
+        println!("registry candidates: {found:#?}");
+        let exe = super::quark_exe();
+        println!("resolved: {exe:?}");
+        assert!(exe.is_some(), "本机已安装夸克，应能解析出 quark.exe 路径");
+        let exe = exe.unwrap();
+        assert!(
+            exe.file_name()
+                .map(|f| f.to_string_lossy().eq_ignore_ascii_case("quark.exe"))
+                .unwrap_or(false),
+            "解析结果必须是 quark.exe：{exe:?}"
+        );
+    }
+
+    #[test]
+    fn cdp_port_helpers() {
+        let p = (super::CDP_PORT_BASE..super::CDP_PORT_BASE + 20)
+            .find(|p| super::port_free(*p))
+            .expect("9333..9352 中应存在空闲端口");
+        assert!(!super::is_cdp_alive(p), "空闲端口上不应有 CDP 服务");
+    }
+
+    #[test]
+    fn quark_candidates_from_cmdline() {
+        let mut out = Vec::new();
+        super::push_quark_candidates(&mut out, r#""D:\My Apps\Quark\Uninstall.exe" --mode"#);
+        assert!(out.contains(&std::path::PathBuf::from(r"D:\My Apps\Quark\quark.exe")));
+
+        let mut out = Vec::new();
+        super::push_quark_candidates(&mut out, r"E:\Soft\Quark\quark.exe,0");
+        assert!(out.contains(&std::path::PathBuf::from(r"E:\Soft\Quark\quark.exe")));
+
+        let mut out = Vec::new();
+        super::push_quark_candidates(&mut out, "");
+        assert!(out.is_empty());
+    }
 }
 
 fn grab_flow() -> Result<(bool, String), String> {
     dbg_log("grab_flow start");
     if !cdp_ready() {
         dbg_log("cdp not ready, killing quark.exe");
+        confirm_kill_quark()?;
         let _ = std::process::Command::new("taskkill")
             .args(["/F", "/T", "/IM", "quark.exe"])
             .creation_flags(CREATE_NO_WINDOW)
             .output();
         thread::sleep(Duration::from_millis(2000));
         let exe = quark_exe()
-            .ok_or("未找到夸克浏览器（期望位于 %LOCALAPPDATA%\\Programs\\Quark\\quark.exe）。请先安装并登录夸克 PC 浏览器。")?;
+            .ok_or(QUARK_NOT_FOUND_MSG)?;
+        let port = cdp_port();
         dbg_log("relaunching quark with debug port");
         std::process::Command::new(&exe)
-            .arg(format!("--remote-debugging-port={CDP_PORT}"))
+            .arg(format!("--remote-debugging-port={port}"))
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .map_err(|e| format!("启动夸克浏览器失败：{e}"))?;
@@ -993,14 +1197,16 @@ fn grab_flow() -> Result<(bool, String), String> {
         }
         if !up {
             dbg_log("debug port timeout (15s)");
-            return Err("夸克浏览器调试端口未就绪（15 秒超时），请重试。".into());
+            return Err(format!(
+                "夸克浏览器调试端口 {port} 未就绪（15 秒超时），请重试。"
+            ));
         }
         dbg_log("debug port ready");
     }
 
     dbg_log("opening new tab");
     let new_tab = http_req(
-        CDP_PORT,
+        cdp_port(),
         "PUT",
         &format!("/json/new?url={}", urlencode(config::CHAT_URL)),
     )?;
@@ -1058,7 +1264,7 @@ fn grab_flow() -> Result<(bool, String), String> {
     }
     if !href.starts_with("https://www.qianwen.com") {
         dbg_log("page never reached qianwen.com");
-        let _ = http_req(CDP_PORT, "GET", &format!("/json/close/{target_id}"));
+        let _ = http_req(cdp_port(), "GET", &format!("/json/close/{target_id}"));
         return Err("夸克聊天页在夸克浏览器中未能加载，请重试。".into());
     }
 
@@ -1081,7 +1287,7 @@ fn grab_flow() -> Result<(bool, String), String> {
     dbg_log(&format!("report written, {} bytes", val.len()));
     let (ok, msg) = apply_report(&report);
     dbg_log(&format!("apply_report ok={ok} msg={msg}"));
-    let _ = http_req(CDP_PORT, "GET", &format!("/json/close/{target_id}"));
+    let _ = http_req(cdp_port(), "GET", &format!("/json/close/{target_id}"));
     dbg_log("tab closed, flow done");
     Ok((ok, msg))
 }
@@ -1119,7 +1325,7 @@ fn grab_net_params(report: &mut Value) {
         return;
     };
     if cdp_call(&mut ws, "Network.enable", serde_json::json!({}), 15).is_err() {
-        let _ = http_req(CDP_PORT, "GET", &format!("/json/close/{target_id}"));
+        let _ = http_req(cdp_port(), "GET", &format!("/json/close/{target_id}"));
         dbg_log("grab_net_params: Network.enable failed");
         return;
     }
@@ -1131,7 +1337,7 @@ fn grab_net_params(report: &mut Value) {
     )
     .is_err()
     {
-        let _ = http_req(CDP_PORT, "GET", &format!("/json/close/{target_id}"));
+        let _ = http_req(cdp_port(), "GET", &format!("/json/close/{target_id}"));
         dbg_log("grab_net_params: navigate failed");
         return;
     }
@@ -1180,7 +1386,7 @@ fn grab_net_params(report: &mut Value) {
             break;
         }
     }
-    let _ = http_req(CDP_PORT, "GET", &format!("/json/close/{target_id}"));
+    let _ = http_req(cdp_port(), "GET", &format!("/json/close/{target_id}"));
     if let Some(p) = params {
         report["net_params"] = p;
         dbg_log("grab_net_params: saved");
@@ -1208,7 +1414,7 @@ fn grab_account_full(report: &mut Value) {
         )
         .is_err()
         {
-            let _ = http_req(CDP_PORT, "GET", &format!("/json/close/{target_id}"));
+            let _ = http_req(cdp_port(), "GET", &format!("/json/close/{target_id}"));
             continue;
         }
         thread::sleep(Duration::from_millis(8000));
@@ -1216,7 +1422,7 @@ fn grab_account_full(report: &mut Value) {
             Ok(r) => r,
             Err(e) => {
                 dbg_log(&format!("grab_account_full eval failed on {url}: {e}"));
-                let _ = http_req(CDP_PORT, "GET", &format!("/json/close/{target_id}"));
+                let _ = http_req(cdp_port(), "GET", &format!("/json/close/{target_id}"));
                 continue;
             }
         };
@@ -1225,7 +1431,7 @@ fn grab_account_full(report: &mut Value) {
             .and_then(|x| x.as_str())
             .unwrap_or("{}");
         dbg_log(&format!("grab_account_full on {url}: {} bytes", val.len()));
-        let _ = http_req(CDP_PORT, "GET", &format!("/json/close/{target_id}"));
+        let _ = http_req(cdp_port(), "GET", &format!("/json/close/{target_id}"));
         if let Ok(v) = serde_json::from_str::<Value>(val) {
             if v.get("full").is_some() {
                 dbg_log(&format!("grab_account_full: FULL found on {url}"));
@@ -1287,7 +1493,7 @@ const ACCOUNT_EXPR: &str = r#"
 
 fn grab_cookies(report: &mut Value) {
     dbg_log("grabbing cookies via Storage.getCookies");
-    let ver = match http_req(CDP_PORT, "GET", "/json/version")
+    let ver = match http_req(cdp_port(), "GET", "/json/version")
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
     {

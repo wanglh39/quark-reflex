@@ -12,6 +12,7 @@ serde_json = "1.0.154"
 tao = "0.37.1"
 tray-icon = "0.26.1"
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_System_Threading", "Win32_Security", "Win32_UI_WindowsAndMessaging"] }
+windows-registry = "0.100.0"
 wry = { version = "0.55", features = ["devtools"] }
 
 [build-dependencies]

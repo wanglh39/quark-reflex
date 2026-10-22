@@ -102,6 +102,7 @@ pub struct Config {
     pub zoom: f64,
     pub pin: bool,
     pub window: Option<WinGeom>,
+    pub quark_exe: String,
 }
 
 impl Default for Config {
@@ -115,6 +116,7 @@ impl Default for Config {
             zoom: 0.9,
             pin: false,
             window: None,
+            quark_exe: String::new(),
         }
     }
 }

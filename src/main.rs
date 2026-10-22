@@ -99,8 +99,36 @@ fn inject_cookies(chat: &WebView) {
     let _ = std::fs::write(config::app_dir().join("cookie-inject.log"), format!("{ok_n}/{}", list.len()));
 }
 
-fn single_instance_acquire() -> Option<SingleGuard> {
+fn webview2_runtime_missing() -> bool {
+    use windows_registry::{CURRENT_USER, LOCAL_MACHINE};
+    const SUBKEY: &str = r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9FC7E11}";
+    const SUBKEY_WOW: &str = r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9FC7E11}";
+    for root in [LOCAL_MACHINE, CURRENT_USER] {
+        for sub in [SUBKEY, SUBKEY_WOW] {
+            if let Ok(key) = root.open(sub) {
+                if let Ok(pv) = key.get_string("pv") {
+                    if !pv.trim().is_empty() {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+fn fatal_msg(text: &str) {
     unsafe {
+        MessageBoxW(
+            None,
+            &windows::core::HSTRING::from(text),
+            w!("夸克助手"),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+}
+
+fn single_instance_acquire() -> Option<SingleGuard> {    unsafe {
         let mutex = CreateMutexW(None, false, w!("Local\\QuarkReflex.SingleInstance")).ok()?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
             if let Ok(ev) = CreateEventW(None, false, false, w!("Local\\QuarkReflex.Wake")) {
@@ -361,7 +389,7 @@ fn open_settings(
         .with_owner_window(main_window.hwnd())
         .with_skip_taskbar(true)
         .with_undecorated_shadow(true)
-        .with_inner_size(LogicalSize::new(440.0, 660.0));
+        .with_inner_size(LogicalSize::new(440.0, 718.0));
     if let Some(ic) = &win_icon {
         wb = wb.with_window_icon(Some(ic.clone()));
     }
@@ -473,6 +501,9 @@ fn apply_settings(
             let _ = chat.zoom(z);
         }
     }
+    if let Some(p) = v.get("qpath").and_then(|x| x.as_str()) {
+        config.quark_exe = p.trim().to_string();
+    }
     snapshot(window, config);
     config::save(config);
     (true, "已保存".into())
@@ -499,6 +530,15 @@ fn main() {
     };
 
     let mut config = config::load();
+
+    if webview2_runtime_missing() {
+        fatal_msg(
+            "未检测到 WebView2 运行时，小窗无法启动。\n\n\
+             请从微软官网下载安装「WebView2 Runtime」后重试：\n\
+             https://developer.microsoft.com/microsoft-edge/webview2/",
+        );
+        return;
+    }
 
     let event_loop = EventLoopBuilder::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -535,7 +575,7 @@ fn main() {
 
     let mut web_ctx = WebContext::new(Some(config::webview_data_dir()));
 
-    let bar = WebViewBuilder::new_with_web_context(&mut web_ctx)
+    let bar = match WebViewBuilder::new_with_web_context(&mut web_ctx)
         .with_html(titlebar::HTML)
         .with_ipc_handler({
             let p = proxy.clone();
@@ -544,10 +584,16 @@ fn main() {
             }
         })
         .build_as_child(&window)
-        .expect("创建标题栏失败");
+    {
+        Ok(v) => v,
+        Err(e) => {
+            fatal_msg(&format!("创建标题栏失败：{e}"));
+            return;
+        }
+    };
 
     let cred_key = cred::gen_key();
-    let chat = WebViewBuilder::new_with_web_context(&mut web_ctx)
+    let chat = match WebViewBuilder::new_with_web_context(&mut web_ctx)
         .with_url(config::CHAT_URL)
         .with_user_agent(config::UA)
         .with_https_scheme(true)
@@ -559,7 +605,13 @@ fn main() {
         .with_devtools(true)
         .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
         .build_as_child(&window)
-        .expect("创建聊天视图失败");
+    {
+        Ok(v) => v,
+        Err(e) => {
+            fatal_msg(&format!("创建聊天视图失败：{e}\n\n若反复出现，请重装 WebView2 Runtime 后重试。"));
+            return;
+        }
+    };
     let _ = chat.zoom(config.zoom);
 
     layout(&window, &bar, &chat);

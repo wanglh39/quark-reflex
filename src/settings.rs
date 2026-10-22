@@ -57,6 +57,16 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
     width: 100%; background: none; border: none; outline: none;
     color: #2a313f; font-size: 13px; text-align: right; font-family: inherit;
   }
+  .path {
+    flex: 1; height: 40px; border-radius: 7px; background: #ffffff;
+    border: 1px solid #e1e7f0; display: flex; align-items: center;
+    padding: 0 12px;
+  }
+  .path input {
+    width: 100%; background: none; border: none; outline: none;
+    color: #2a313f; font-size: 12px; font-family: inherit;
+  }
+  .path input::placeholder { color: #a7b0c0; font-size: 12px; }
   select {
     width: 100%; height: 40px; border-radius: 7px; background: #f7f9fc;
     border: 1px solid #e1e7f0; color: #2a313f; font-size: 13px;
@@ -129,6 +139,16 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       <option value="1.1">110%</option>
       <option value="1.25">125%</option>
     </select>
+    <div class="sec">夸克浏览器</div>
+    <div class="card">
+      <div class="row">
+        <div class="lab">程序路径</div>
+        <div class="path">
+          <input id="qpath" type="text" value="__QPATH__" spellcheck="false" placeholder="留空则自动检测安装位置">
+        </div>
+      </div>
+    </div>
+    <div class="hint">夸克浏览器安装在非默认位置导致无法启动时，在此填写 quark.exe 的完整路径。</div>
   </div>
   <div class="foot">
     <div class="msg" id="msg"></div>
@@ -214,7 +234,8 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       ch: parseFloat(document.getElementById('ch').value) || 0,
       rw: parseFloat(document.getElementById('rw').value) || 0,
       rh: parseFloat(document.getElementById('rh').value) || 0,
-      zoom: parseFloat(document.getElementById('zoom').value) || 0.9
+      zoom: parseFloat(document.getElementById('zoom').value) || 0.9,
+      qpath: document.getElementById('qpath').value.trim()
     });
   };
   window.__qrResult = function (msg) {
@@ -228,6 +249,11 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
 "##;
 
 pub fn render(config: &Config) -> String {
+    let qpath = config
+        .quark_exe
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('"', "&quot;");
     TEMPLATE
         .replace("__HOTKEY__", &config.hotkey)
         .replace("__COLLAPSE__", &config.collapse_mode)
@@ -236,4 +262,5 @@ pub fn render(config: &Config) -> String {
         .replace("__RW__", &format!("{}", config.reading.w))
         .replace("__RH__", &format!("{}", config.reading.h))
         .replace("__ZOOM__", &format!("{}", config.zoom))
+        .replace("__QPATH__", &qpath)
 }
