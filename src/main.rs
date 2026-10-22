@@ -101,11 +101,13 @@ fn inject_cookies(chat: &WebView) {
 
 fn webview2_runtime_missing() -> bool {
     use windows_registry::{CURRENT_USER, LOCAL_MACHINE};
-    const SUBKEY: &str = r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9FC7E11}";
-    const SUBKEY_WOW: &str = r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9FC7E11}";
+    const RUNTIME_GUID: &str = "{F3017226-FE2A-4295-8BDF-00C3A9FC7E51}";
     for root in [LOCAL_MACHINE, CURRENT_USER] {
-        for sub in [SUBKEY, SUBKEY_WOW] {
-            if let Ok(key) = root.open(sub) {
+        for sub in [
+            format!(r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{RUNTIME_GUID}"),
+            format!(r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{RUNTIME_GUID}"),
+        ] {
+            if let Ok(key) = root.open(&sub) {
                 if let Ok(pv) = key.get_string("pv") {
                     if !pv.trim().is_empty() {
                         return false;
@@ -114,7 +116,58 @@ fn webview2_runtime_missing() -> bool {
             }
         }
     }
+    for base in [
+        r"C:\Program Files (x86)\Microsoft\EdgeWebView\Application",
+        r"C:\Program Files\Microsoft\EdgeWebView\Application",
+    ] {
+        if let Ok(entries) = std::fs::read_dir(base) {
+            if entries.filter_map(|e| e.ok()).any(|e| e.path().join("msedgewebview2.exe").is_file()) {
+                return false;
+            }
+        }
+    }
+    for p in [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ] {
+        if std::path::Path::new(p).is_file() {
+            return false;
+        }
+    }
+    if let Ok(dir) = std::env::var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER") {
+        if !dir.trim().is_empty() {
+            return false;
+        }
+    }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn webview2_detected_on_local_machine() {
+        assert!(
+            !super::webview2_runtime_missing(),
+            "本机装有 WebView2（EdgeWebView 155.0.4283.62），预检必须放行，不能误报"
+        );
+    }
+}
+
+fn confirm_start_without_webview2() -> bool {    use windows::Win32::UI::WindowsAndMessaging::{IDYES, MB_ICONWARNING, MB_YESNO};
+    let r = unsafe {
+        MessageBoxW(
+            None,
+            windows::core::w!(
+                "未检测到 WebView2 运行时，小窗可能无法启动。\n\n\
+                 建议从微软官网安装「WebView2 Runtime」：\n\
+                 https://developer.microsoft.com/microsoft-edge/webview2/\n\n\
+                 是否仍要尝试启动？"
+            ),
+            w!("夸克助手"),
+            MB_YESNO | MB_ICONWARNING,
+        )
+    };
+    r == IDYES
 }
 
 fn fatal_msg(text: &str) {
@@ -128,7 +181,8 @@ fn fatal_msg(text: &str) {
     }
 }
 
-fn single_instance_acquire() -> Option<SingleGuard> {    unsafe {
+fn single_instance_acquire() -> Option<SingleGuard> {
+    unsafe {
         let mutex = CreateMutexW(None, false, w!("Local\\QuarkReflex.SingleInstance")).ok()?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
             if let Ok(ev) = CreateEventW(None, false, false, w!("Local\\QuarkReflex.Wake")) {
@@ -531,12 +585,7 @@ fn main() {
 
     let mut config = config::load();
 
-    if webview2_runtime_missing() {
-        fatal_msg(
-            "未检测到 WebView2 运行时，小窗无法启动。\n\n\
-             请从微软官网下载安装「WebView2 Runtime」后重试：\n\
-             https://developer.microsoft.com/microsoft-edge/webview2/",
-        );
+    if webview2_runtime_missing() && !confirm_start_without_webview2() {
         return;
     }
 
