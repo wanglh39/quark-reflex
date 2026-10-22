@@ -58,6 +58,49 @@ pub fn cred_path() -> PathBuf {
     config::app_dir().join("creds.json")
 }
 
+pub fn login_fingerprint() -> u64 {
+    let Ok(txt) = std::fs::read_to_string(cred_path()) else {
+        return 0;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&txt) else {
+        return 0;
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    if let Some(list) = v.get("cookies").and_then(|c| c.as_array()) {
+        let mut login: Vec<(String, String)> = list
+            .iter()
+            .filter_map(|c| {
+                let name = c.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                if !name.starts_with("login_") {
+                    return None;
+                }
+                Some((
+                    name.to_string(),
+                    c.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                ))
+            })
+            .collect();
+        login.sort();
+        for (n, val) in login {
+            use std::hash::Hasher;
+            hasher.write(n.as_bytes());
+            hasher.write(val.as_bytes());
+        }
+    }
+    for path in [
+        v.pointer("/account/data/kps_wg").and_then(|x| x.as_str()),
+        v.pointer("/ucparams/ut").and_then(|x| x.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        use std::hash::Hasher;
+        hasher.write(path.as_bytes());
+    }
+    use std::hash::Hasher;
+    hasher.finish()
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -462,18 +505,37 @@ fn ensure_bridge_ws(refresh: bool) -> Result<String, String> {
     } else if let Ok(mut g) = BRIDGE_WS.lock() {
         *g = None;
     }
-    if let Ok(urls) = qianwen_page_ws_urls() {
-        for u in urls {
-            if let Ok(v) = try_bridge_eval(&u, bridge_ready_js(), 4) {
+    let mut wait_rounds = 0u32;
+    loop {
+        let urls = qianwen_page_ws_urls().unwrap_or_default();
+        if urls.is_empty() {
+            break;
+        }
+        let mut reused: Option<String> = None;
+        for u in &urls {
+            if let Ok(v) = try_bridge_eval(u, bridge_ready_js(), 4) {
                 if v.as_bool().unwrap_or(false) {
-                    if let Ok(mut g) = BRIDGE_WS.lock() {
-                        *g = Some(u.clone());
-                    }
-                    dbg_log("bridge: reusing existing quarkchat page");
-                    return Ok(u);
+                    reused = Some(u.clone());
+                    break;
                 }
             }
         }
+        if let Some(u) = reused {
+            if let Ok(mut g) = BRIDGE_WS.lock() {
+                *g = Some(u.clone());
+            }
+            dbg_log("bridge: reusing existing quarkchat page");
+            return Ok(u);
+        }
+        if wait_rounds >= 5 {
+            dbg_log("bridge: existing page not ready after waiting, opening new tab");
+            break;
+        }
+        if wait_rounds == 0 {
+            dbg_log("bridge: existing quarkchat page loading, waiting for it");
+        }
+        wait_rounds += 1;
+        thread::sleep(Duration::from_secs(2));
     }
     let body = http_req(cdp_port(), "PUT", "/json/new")?;
     let tab: Value =
@@ -1204,25 +1266,36 @@ fn grab_flow() -> Result<(bool, String), String> {
         dbg_log("debug port ready");
     }
 
-    dbg_log("opening new tab");
-    let new_tab = http_req(
-        cdp_port(),
-        "PUT",
-        &format!("/json/new?url={}", urlencode(config::CHAT_URL)),
-    )?;
-    let tab: Value =
-        serde_json::from_str(&new_tab).map_err(|e| format!("新标签页响应解析失败：{e}"))?;
-    let target_id = tab
-        .get("id")
-        .and_then(|x| x.as_str())
-        .ok_or("未取到标签页 ID")?
-        .to_string();
-    let ws_url = tab
-        .get("webSocketDebuggerUrl")
-        .and_then(|x| x.as_str())
-        .ok_or("未取到调试 WebSocket 地址")?
-        .to_string();
-    dbg_log(&format!("tab {target_id} opened"));
+    let (target_id, ws_url) = match qianwen_page_ws_urls() {
+        Ok(urls) if !urls.is_empty() => {
+            let ws_url = urls[0].clone();
+            let target_id = ws_url.rsplit('/').next().unwrap_or("").to_string();
+            dbg_log(&format!("reusing existing quarkchat tab {target_id}"));
+            (target_id, ws_url)
+        }
+        _ => {
+            dbg_log("opening new tab");
+            let new_tab = http_req(
+                cdp_port(),
+                "PUT",
+                &format!("/json/new?url={}", urlencode(config::CHAT_URL)),
+            )?;
+            let tab: Value = serde_json::from_str(&new_tab)
+                .map_err(|e| format!("新标签页响应解析失败：{e}"))?;
+            let target_id = tab
+                .get("id")
+                .and_then(|x| x.as_str())
+                .ok_or("未取到标签页 ID")?
+                .to_string();
+            let ws_url = tab
+                .get("webSocketDebuggerUrl")
+                .and_then(|x| x.as_str())
+                .ok_or("未取到调试 WebSocket 地址")?
+                .to_string();
+            dbg_log(&format!("tab {target_id} opened"));
+            (target_id, ws_url)
+        }
+    };
 
     let mut ws = ws_connect_url(&ws_url)?;
     dbg_log("navigating tab");
@@ -1279,7 +1352,7 @@ fn grab_flow() -> Result<(bool, String), String> {
     let mut report: Value =
         serde_json::from_str(val).map_err(|e| format!("抓取结果解析失败：{e}"))?;
     grab_cookies(&mut report);
-    grab_net_params(&mut report);
+    grab_net_params(&mut report, &mut ws);
     let _ = std::fs::write(
         config::app_dir().join("creds-report.json"),
         serde_json::to_string(&report).unwrap_or_else(|_| val.to_string()),
@@ -1287,8 +1360,12 @@ fn grab_flow() -> Result<(bool, String), String> {
     dbg_log(&format!("report written, {} bytes", val.len()));
     let (ok, msg) = apply_report(&report);
     dbg_log(&format!("apply_report ok={ok} msg={msg}"));
-    let _ = http_req(cdp_port(), "GET", &format!("/json/close/{target_id}"));
-    dbg_log("tab closed, flow done");
+    if !ok {
+        let _ = http_req(cdp_port(), "GET", &format!("/json/close/{target_id}"));
+        dbg_log("tab closed (grab failed)");
+    } else {
+        dbg_log("tab kept alive for bridge");
+    }
     Ok((ok, msg))
 }
 
@@ -1318,26 +1395,20 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-fn grab_net_params(report: &mut Value) {
-    dbg_log("grab_net_params: opening tab");
-    let Ok((target_id, mut ws)) = open_chat_tab() else {
-        dbg_log("grab_net_params: open tab failed");
-        return;
-    };
-    if cdp_call(&mut ws, "Network.enable", serde_json::json!({}), 15).is_err() {
-        let _ = http_req(cdp_port(), "GET", &format!("/json/close/{target_id}"));
+fn grab_net_params(report: &mut Value, ws: &mut WsConn) {
+    dbg_log("grab_net_params: reusing grab tab");
+    if cdp_call(ws, "Network.enable", serde_json::json!({}), 15).is_err() {
         dbg_log("grab_net_params: Network.enable failed");
         return;
     }
     if cdp_call(
-        &mut ws,
+        ws,
         "Page.navigate",
         serde_json::json!({ "url": config::CHAT_URL }),
         30,
     )
     .is_err()
     {
-        let _ = http_req(cdp_port(), "GET", &format!("/json/close/{target_id}"));
         dbg_log("grab_net_params: navigate failed");
         return;
     }
@@ -1386,7 +1457,7 @@ fn grab_net_params(report: &mut Value) {
             break;
         }
     }
-    let _ = http_req(cdp_port(), "GET", &format!("/json/close/{target_id}"));
+
     if let Some(p) = params {
         report["net_params"] = p;
         dbg_log("grab_net_params: saved");

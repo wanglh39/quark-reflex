@@ -684,6 +684,7 @@ fn main() {
 
     let _tray = build_tray(&rgba, iw, ih).expect("托盘创建失败");
 
+    let pre_grab_fp = cred::login_fingerprint();
     cred::start_grab(proxy.clone());
 
     if config.pin {
@@ -739,7 +740,9 @@ fn main() {
                     show_main(&window, &chat, &settings_ui, settings_open);
                     inject_cookies(&chat);
                     cred::start_agent_poll();
-                    let _ = chat.load_url(config::CHAT_URL);
+                    if cred::login_fingerprint() != pre_grab_fp {
+                        let _ = chat.load_url(config::CHAT_URL);
+                    }
                     if std::env::var("QR_PROBE").as_deref() == Ok("1") {
                         for n in [1u32, 2, 3, 4, 5] {
                             let p = proxy.clone();
