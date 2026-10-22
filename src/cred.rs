@@ -733,35 +733,7 @@ pub fn start_grab(proxy: tao::event_loop::EventLoopProxy<crate::AppEvent>) {
 }
 
 fn open_chat_tab() -> Result<(String, WsConn), String> {
-    if !cdp_ready() {
-        confirm_kill_quark()?;
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/T", "/IM", "quark.exe"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-        thread::sleep(Duration::from_millis(2000));
-        let exe = quark_exe()
-            .ok_or(QUARK_NOT_FOUND_MSG)?;
-        let port = cdp_port();
-        std::process::Command::new(&exe)
-            .arg(format!("--remote-debugging-port={port}"))
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-            .map_err(|e| format!("启动夸克浏览器失败：{e}"))?;
-        let mut up = false;
-        for _ in 0..30 {
-            thread::sleep(Duration::from_millis(500));
-            if cdp_ready() {
-                up = true;
-                break;
-            }
-        }
-        if !up {
-            return Err(format!(
-                "夸克浏览器调试端口 {port} 未就绪（15 秒超时），请重试。"
-            ));
-        }
-    }
+    launch_cdp_quark()?;
     let new_tab = http_req(
         cdp_port(),
         "PUT",
@@ -997,29 +969,154 @@ fn quark_running() -> bool {
         .unwrap_or(false)
 }
 
-fn confirm_kill_quark() -> Result<(), String> {
-    if !quark_running() {
+fn quark_user_data_dir() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        candidates.push(PathBuf::from(local).join("Quark").join("User Data"));
+    }
+    if let Some(exe) = quark_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("User Data"));
+        }
+    }
+    candidates.into_iter().find(|ud| {
+        ud.join("Local State").is_file()
+            && (ud.join("Default").join("Network").join("Cookies").is_file()
+                || ud.join("Default").join("Cookies").is_file())
+    })
+}
+
+fn copy_if_exists(src: &std::path::Path, dst: &std::path::Path) {
+    if !src.is_file() {
+        return;
+    }
+    if let Some(parent) = dst.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::copy(src, dst);
+}
+
+fn cdp_profile_dir() -> PathBuf {
+    config::app_dir().join("cdp-profile")
+}
+
+fn clone_profile_for_cdp() -> Option<PathBuf> {
+    let src = quark_user_data_dir()?;
+    let dst = cdp_profile_dir();
+    let dst_cookies = dst
+        .join("Default")
+        .join("Network")
+        .join("Cookies");
+    if dst_cookies.is_file() {
+        return Some(dst);
+    }
+    dbg_log(&format!(
+        "cloning profile {} -> {}",
+        src.display(),
+        dst.display()
+    ));
+    copy_if_exists(&src.join("Local State"), &dst.join("Local State"));
+    let sdef = src.join("Default");
+    let ddef = dst.join("Default");
+    copy_if_exists(&sdef.join("Preferences"), &ddef.join("Preferences"));
+    copy_if_exists(
+        &sdef.join("Secure Preferences"),
+        &ddef.join("Secure Preferences"),
+    );
+    if sdef.join("Network").join("Cookies").is_file() {
+        copy_if_exists(
+            &sdef.join("Network").join("Cookies"),
+            &ddef.join("Network").join("Cookies"),
+        );
+        copy_if_exists(
+            &sdef.join("Network").join("Cookies-journal"),
+            &ddef.join("Network").join("Cookies-journal"),
+        );
+    } else {
+        copy_if_exists(&sdef.join("Cookies"), &ddef.join("Network").join("Cookies"));
+        copy_if_exists(
+            &sdef.join("Cookies-journal"),
+            &ddef.join("Network").join("Cookies-journal"),
+        );
+    }
+    copy_if_exists(&sdef.join("Login Data"), &ddef.join("Login Data"));
+    copy_if_exists(
+        &sdef.join("Login Data-journal"),
+        &ddef.join("Login Data-journal"),
+    );
+    if !dst_cookies.is_file() {
+        return None;
+    }
+    Some(dst)
+}
+
+static OWN_CDP_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn stop_own_cdp_instance() {
+    let pid = OWN_CDP_PID.swap(0, std::sync::atomic::Ordering::SeqCst);
+    if pid == 0 {
+        return;
+    }
+    dbg_log(&format!("stopping own cdp instance pid={pid}"));
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+}
+
+fn launch_cdp_quark() -> Result<(), String> {
+    if cdp_ready() {
         return Ok(());
     }
-    use windows::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, IDYES, MB_ICONWARNING, MB_YESNO,
-    };
-    let r = unsafe {
-        MessageBoxW(
-            None,
-            windows::core::w!(
-                "获取登录凭证需要以调试模式重启夸克浏览器。\n\
-                 正在浏览的页面将会关闭，未保存的内容可能丢失。\n\n是否继续？"
-            ),
-            windows::core::w!("夸克助手"),
-            MB_YESNO | MB_ICONWARNING,
-        )
-    };
-    if r == IDYES {
-        Ok(())
+    let exe = quark_exe().ok_or(QUARK_NOT_FOUND_MSG)?;
+    let port = cdp_port();
+    let running = quark_running();
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg(format!("--remote-debugging-port={port}"))
+        .arg("--no-first-run")
+        .arg("--no-default-browser-check");
+    if running {
+        let dir = clone_profile_for_cdp();
+        if let Some(d) = &dir {
+            dbg_log(&format!(
+                "quark running, launching isolated instance with profile {}",
+                d.display()
+            ));
+            cmd.arg(format!("--user-data-dir={}", d.display()));
+        } else {
+            dbg_log("quark running but no profile cloned, isolated profile will be fresh");
+            cmd.arg(format!("--user-data-dir={}", cdp_profile_dir().display()));
+        }
     } else {
-        Err("已取消：本次未获取登录凭证。".into())
+        dbg_log("quark not running, launching with user profile + debug port");
     }
+    let child = cmd
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|e| format!("启动夸克浏览器失败：{e}"))?;
+    if running {
+        OWN_CDP_PID.store(child.id(), std::sync::atomic::Ordering::SeqCst);
+    }
+    let mut up = false;
+    for i in 0..40 {
+        thread::sleep(Duration::from_millis(500));
+        if cdp_ready() {
+            up = true;
+            break;
+        }
+        if i % 10 == 9 {
+            dbg_log("still waiting for debug port");
+        }
+    }
+    if !up {
+        dbg_log("debug port timeout (20s)");
+        stop_own_cdp_instance();
+        return Err(format!(
+            "夸克浏览器调试端口 {port} 未就绪（20 秒超时），请重试。"
+        ));
+    }
+    dbg_log("debug port ready");
+    Ok(())
 }
 
 fn quark_exe() -> Option<PathBuf> {
@@ -1150,6 +1247,34 @@ mod tests {
     }
 
     #[test]
+    fn quark_user_data_dir_found_on_local_machine() {
+        let ud = super::quark_user_data_dir();
+        println!("user data dir: {ud:?}");
+        assert!(ud.is_some(), "本机装有夸克浏览器，应能找到 User Data 目录");
+        let ud = ud.unwrap();
+        assert!(ud.join("Local State").is_file());
+    }
+
+    #[test]
+    fn copy_if_exists_roundtrip() {
+        let tmp = std::env::temp_dir().join("qr-copy-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("src").join("Default").join("Network")).unwrap();
+        std::fs::create_dir_all(tmp.join("dst").join("Default").join("Network")).unwrap();
+        let src_file = tmp.join("src").join("Default").join("Network").join("Cookies");
+        std::fs::write(&src_file, b"cookie-blob").unwrap();
+        super::copy_if_exists(
+            &src_file,
+            &tmp.join("dst").join("Default").join("Network").join("Cookies"),
+        );
+        let dst_file = tmp.join("dst").join("Default").join("Network").join("Cookies");
+        assert_eq!(std::fs::read(&dst_file).unwrap(), b"cookie-blob");
+        super::copy_if_exists(&tmp.join("src").join("nope"), &tmp.join("dst").join("nope"));
+        assert!(!tmp.join("dst").join("nope").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn quark_candidates_from_cmdline() {
         let mut out = Vec::new();
         super::push_quark_candidates(&mut out, r#""D:\My Apps\Quark\Uninstall.exe" --mode"#);
@@ -1166,43 +1291,14 @@ mod tests {
 }
 
 fn grab_flow() -> Result<(bool, String), String> {
+    let r = grab_flow_inner();
+    stop_own_cdp_instance();
+    r
+}
+
+fn grab_flow_inner() -> Result<(bool, String), String> {
     dbg_log("grab_flow start");
-    if !cdp_ready() {
-        dbg_log("cdp not ready, killing quark.exe");
-        confirm_kill_quark()?;
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/T", "/IM", "quark.exe"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-        thread::sleep(Duration::from_millis(2000));
-        let exe = quark_exe()
-            .ok_or(QUARK_NOT_FOUND_MSG)?;
-        let port = cdp_port();
-        dbg_log("relaunching quark with debug port");
-        std::process::Command::new(&exe)
-            .arg(format!("--remote-debugging-port={port}"))
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-            .map_err(|e| format!("启动夸克浏览器失败：{e}"))?;
-        let mut up = false;
-        for i in 0..30 {
-            thread::sleep(Duration::from_millis(500));
-            if cdp_ready() {
-                up = true;
-                break;
-            }
-            if i % 10 == 9 {
-                dbg_log("still waiting for debug port");
-            }
-        }
-        if !up {
-            dbg_log("debug port timeout (15s)");
-            return Err(format!(
-                "夸克浏览器调试端口 {port} 未就绪（15 秒超时），请重试。"
-            ));
-        }
-        dbg_log("debug port ready");
-    }
+    launch_cdp_quark()?;
 
     dbg_log("opening new tab");
     let new_tab = http_req(
@@ -1286,7 +1382,16 @@ fn grab_flow() -> Result<(bool, String), String> {
     );
     dbg_log(&format!("report written, {} bytes", val.len()));
     let (ok, msg) = apply_report(&report);
-    dbg_log(&format!("apply_report ok={ok} msg={msg}"));
+    let msg = if !ok && msg.contains("未登录") && OWN_CDP_PID.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        format!(
+            "{msg}\n\n本次抓取在独立夸克窗口中进行，未影响你正在使用的浏览器。\
+             若登录态未能带入该窗口，请在刚弹出的夸克窗口中登录一次，\
+             之后重新获取即可（登录态会被记住）。"
+        )
+    } else {
+        msg
+    };
+    dbg_log(&format!("apply_report ok={ok}"));
     let _ = http_req(cdp_port(), "GET", &format!("/json/close/{target_id}"));
     dbg_log("tab closed, flow done");
     Ok((ok, msg))
