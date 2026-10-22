@@ -1000,53 +1000,87 @@ fn cdp_profile_dir() -> PathBuf {
     config::app_dir().join("cdp-profile")
 }
 
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path, max_file: u64) {
+    let Ok(entries) = std::fs::read_dir(src) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(dst);
+    for e in entries.filter_map(|x| x.ok()) {
+        let s = e.path();
+        let d = dst.join(e.file_name());
+        if s.is_dir() {
+            copy_dir_recursive(&s, &d, max_file);
+        } else if let Ok(m) = e.metadata() {
+            if m.len() <= max_file {
+                let _ = std::fs::copy(&s, &d);
+            }
+        }
+    }
+}
+
 fn clone_profile_for_cdp() -> Option<PathBuf> {
     let src = quark_user_data_dir()?;
     let dst = cdp_profile_dir();
-    let dst_cookies = dst
-        .join("Default")
-        .join("Network")
-        .join("Cookies");
-    if dst_cookies.is_file() {
+    const CLONE_VERSION: &str = "2";
+    let ver_ok =
+        std::fs::read_to_string(dst.join(".qr-clone-ver")).unwrap_or_default() == CLONE_VERSION;
+    let user_info_ok = dst.join("user_info").is_dir();
+    if ver_ok && user_info_ok {
         return Some(dst);
     }
     dbg_log(&format!(
-        "cloning profile {} -> {}",
+        "cloning profile {} -> {} (full, ver {CLONE_VERSION})",
         src.display(),
         dst.display()
     ));
+    let _ = std::fs::remove_dir_all(&dst);
+    const MAX_FILE: u64 = 20 * 1024 * 1024;
     copy_if_exists(&src.join("Local State"), &dst.join("Local State"));
+    copy_dir_recursive(&src.join("user_info"), &dst.join("user_info"), MAX_FILE);
     let sdef = src.join("Default");
     let ddef = dst.join("Default");
-    copy_if_exists(&sdef.join("Preferences"), &ddef.join("Preferences"));
-    copy_if_exists(
-        &sdef.join("Secure Preferences"),
-        &ddef.join("Secure Preferences"),
-    );
-    if sdef.join("Network").join("Cookies").is_file() {
-        copy_if_exists(
-            &sdef.join("Network").join("Cookies"),
-            &ddef.join("Network").join("Cookies"),
-        );
-        copy_if_exists(
-            &sdef.join("Network").join("Cookies-journal"),
-            &ddef.join("Network").join("Cookies-journal"),
-        );
-    } else {
-        copy_if_exists(&sdef.join("Cookies"), &ddef.join("Network").join("Cookies"));
-        copy_if_exists(
-            &sdef.join("Cookies-journal"),
-            &ddef.join("Network").join("Cookies-journal"),
-        );
+    let mut cookies_copied = false;
+    if let Ok(entries) = std::fs::read_dir(&sdef) {
+        for e in entries.filter_map(|x| x.ok()) {
+            let s = e.path();
+            let d = ddef.join(e.file_name());
+            if s.is_dir() {
+                continue;
+            }
+            if let Ok(m) = e.metadata() {
+                if m.len() <= MAX_FILE && std::fs::copy(&s, &d).is_ok() {
+                    if e.file_name().eq_ignore_ascii_case("Cookies") {
+                        cookies_copied = true;
+                    }
+                }
+            }
+        }
     }
-    copy_if_exists(&sdef.join("Login Data"), &ddef.join("Login Data"));
-    copy_if_exists(
-        &sdef.join("Login Data-journal"),
-        &ddef.join("Login Data-journal"),
-    );
-    if !dst_cookies.is_file() {
+    for dir in [
+        "Network",
+        "quark_leveldb_storage",
+        "Local Storage",
+        "Session Storage",
+        "WebStorage",
+        "Sessions",
+        "Sync Data",
+        "Local Extension Settings",
+        "Sync Extension Settings",
+    ] {
+        let s = sdef.join(dir);
+        if s.is_dir() {
+            copy_dir_recursive(&s, &ddef.join(dir), MAX_FILE);
+        }
+    }
+    if !dst.join("user_info").is_dir() {
+        dbg_log("clone failed: user_info not copied");
         return None;
     }
+    if !cookies_copied && !dst.join("Default").join("Network").join("Cookies").is_file() {
+        dbg_log("Cookies locked or absent (browser running); isolated instance will rebuild or wait for login");
+    }
+    let _ = std::fs::write(dst.join(".qr-clone-ver"), CLONE_VERSION);
+    dbg_log("profile cloned");
     Some(dst)
 }
 
@@ -1057,7 +1091,29 @@ fn stop_own_cdp_instance() {
     if pid == 0 {
         return;
     }
-    dbg_log(&format!("stopping own cdp instance pid={pid}"));
+    dbg_log(&format!("stopping own cdp instance pid={pid} gracefully"));
+    let mut closed = false;
+    if let Ok(ver) = http_req(cdp_port(), "GET", "/json/version") {
+        if let Ok(v) = serde_json::from_str::<Value>(&ver) {
+            if let Some(ws_url) = v.get("webSocketDebuggerUrl").and_then(|x| x.as_str()) {
+                if let Ok(mut ws) = ws_connect_url(ws_url) {
+                    if cdp_call(&mut ws, "Browser.close", serde_json::json!({}), 10).is_ok() {
+                        closed = true;
+                    }
+                }
+            }
+        }
+    }
+    if closed {
+        for _ in 0..10 {
+            thread::sleep(Duration::from_millis(500));
+            if !cdp_ready() {
+                dbg_log("own instance closed gracefully");
+                return;
+            }
+        }
+    }
+    dbg_log("graceful close failed/timeout, force killing");
     let _ = std::process::Command::new("taskkill")
         .args(["/F", "/T", "/PID", &pid.to_string()])
         .creation_flags(CREATE_NO_WINDOW)
@@ -1275,6 +1331,29 @@ mod tests {
     }
 
     #[test]
+    fn clone_profile_copies_login_state_files() {
+        let _ = std::fs::remove_dir_all(super::cdp_profile_dir());
+        let cloned = super::clone_profile_for_cdp();
+        println!("cloned: {cloned:?}");
+        let dst = super::cdp_profile_dir();
+        assert!(cloned.is_some());
+        assert!(
+            dst.join("user_info").is_dir(),
+            "user_info 目录（夸克账号登录态，无文件锁）必须复制成功"
+        );
+        assert!(dst.join("Local State").is_file());
+        let cookies = dst.join("Default").join("Network").join("Cookies");
+        println!(
+            "cookies copied: {} (夸克运行中会被独占锁定，允许缺失)",
+            cookies.is_file()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join(".qr-clone-ver")).unwrap_or_default(),
+            "2"
+        );
+    }
+
+    #[test]
     fn quark_candidates_from_cmdline() {
         let mut out = Vec::new();
         super::push_quark_candidates(&mut out, r#""D:\My Apps\Quark\Uninstall.exe" --mode"#);
@@ -1382,14 +1461,73 @@ fn grab_flow_inner() -> Result<(bool, String), String> {
     );
     dbg_log(&format!("report written, {} bytes", val.len()));
     let (ok, msg) = apply_report(&report);
-    let msg = if !ok && msg.contains("未登录") && OWN_CDP_PID.load(std::sync::atomic::Ordering::SeqCst) != 0 {
-        format!(
-            "{msg}\n\n本次抓取在独立夸克窗口中进行，未影响你正在使用的浏览器。\
-             若登录态未能带入该窗口，请在刚弹出的夸克窗口中登录一次，\
-             之后重新获取即可（登录态会被记住）。"
-        )
+
+    let (ok, msg) = if !ok
+        && msg.contains("kps_wg")
+        && OWN_CDP_PID.load(std::sync::atomic::Ordering::SeqCst) != 0
+    {
+        dbg_log("kps_wg missing, keeping window open and waiting for login");
+        let mut final_result = (ok, msg);
+        for round in 1..=40u32 {
+            thread::sleep(Duration::from_secs(15));
+            dbg_log(&format!("login wait round {round}"));
+            let resp = match cdp_eval(&mut ws, GRAB_EXPR, 90) {
+                Ok(r) => r,
+                Err(e) => {
+                    dbg_log(&format!("login wait eval err: {e}, reconnecting"));
+                    match ws_connect_url(&ws_url) {
+                        Ok(w) => {
+                            ws = w;
+                            continue;
+                        }
+                        Err(e2) => {
+                            dbg_log(&format!("reconnect failed: {e2}"));
+                            break;
+                        }
+                    }
+                }
+            };
+            let Some(nval) = resp
+                .pointer("/result/result/value")
+                .and_then(|x| x.as_str())
+            else {
+                continue;
+            };
+            let Ok(new_fields) = serde_json::from_str::<Value>(nval) else {
+                continue;
+            };
+            if let Some(obj) = report.as_object_mut() {
+                for (k, v) in new_fields.as_object().into_iter().flatten() {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            grab_cookies(&mut report);
+            let (ok2, msg2) = apply_report(&report);
+            if ok2 {
+                let _ = std::fs::write(
+                    config::app_dir().join("creds-report.json"),
+                    serde_json::to_string(&report).unwrap_or_default(),
+                );
+                final_result = (ok2, msg2);
+                dbg_log("login detected during wait, success");
+                break;
+            }
+            final_result = (ok2, msg2);
+        }
+        if !final_result.0 {
+            final_result = (
+                false,
+                format!(
+                    "{}\n\n已保持独立夸克窗口打开等待登录（未影响你正在使用的浏览器）。\
+                     请在弹出的夸克窗口中登录夸克账号后，再次获取登录凭证\
+                     （登录一次即可，之后会被记住）。等待期间未检测到登录。",
+                    final_result.1
+                ),
+            );
+        }
+        final_result
     } else {
-        msg
+        (ok, msg)
     };
     dbg_log(&format!("apply_report ok={ok}"));
     let _ = http_req(cdp_port(), "GET", &format!("/json/close/{target_id}"));
